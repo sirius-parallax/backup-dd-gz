@@ -1,6 +1,6 @@
 #!/bin/bash
 # =====================================================================
-# Disk/Partition Backup Manager v6.7 (Astra/Linux)
+# Disk/Partition Backup Manager v6.8 (Astra/Linux)
 # =====================================================================
 
 set -u
@@ -15,17 +15,13 @@ warning(){ echo -e "${YELLOW}[WARN]${NC} $1"; }
 info(){ echo -e "${CYAN}[INFO]${NC} $1"; }
 
 CONFIG_FILE="$HOME/.backup_manager_config"
-NET_CONFIG_DIR="$HOME/.backup_manager_destinations"
+PROFILES_DIR="$HOME/.backup_manager_profiles"
 BACKUP_LOCATION=""
 COMPRESSION_ENABLED=true
 PROGRESS_METHOD="builtin"
 NETWORK_MOUNTED=false
 MOUNT_POINT="/tmp/backup_mount_$$"
 SELECTED_DISKS=()
-
-# Массивы для множественных назначений
-declare -A DEVICE_DESTINATIONS  # Массив: устройство -> назначение
-declare -A MOUNTED_POINTS       # Массив: имя_конфига -> точка_монтирования
 
 HAS_PV=false; HAS_DCFLDD=false; HAS_PROGRESS=false
 HAS_CIFS_UTILS=false; HAS_SSHFS=false
@@ -35,7 +31,7 @@ check_root(){ [[ $EUID -ne 0 ]] && { error "Run as root"; exit 1; }; }
 save_config(){
   mkdir -p "$(dirname "$CONFIG_FILE")" 2>/dev/null
   {
-    echo "# config v6.7 $(date)"
+    echo "# config v6.8 $(date)"
     echo "COMPRESSION_ENABLED=$COMPRESSION_ENABLED"
     if [[ -n "$BACKUP_LOCATION" && $NETWORK_MOUNTED = false ]]; then
       printf 'BACKUP_LOCATION=%q\n' "$BACKUP_LOCATION"
@@ -46,12 +42,6 @@ save_config(){
     local i
     for i in "${SELECTED_DISKS[@]}"; do printf "%q " "$i"; done
     echo ")"
-    
-    # Сохраняем назначения для устройств
-    echo "# Device destinations"
-    for dev in "${!DEVICE_DESTINATIONS[@]}"; do
-      printf 'DEVICE_DESTINATIONS[%q]=%q\n' "$dev" "${DEVICE_DESTINATIONS[$dev]}"
-    done
   } > "$CONFIG_FILE" && success "Saved: $CONFIG_FILE" || error "Cannot save config"
 }
 
@@ -71,61 +61,153 @@ load_config(){
   }
 }
 
-# Функции для работы с множественными сетевыми конфигурациями
-save_network_destination(){
+save_connection_profile(){
   local name="$1" type="$2"
-  mkdir -p "$NET_CONFIG_DIR" 2>/dev/null
-  local config_file="$NET_CONFIG_DIR/$name.conf"
+  mkdir -p "$PROFILES_DIR" 2>/dev/null
+  local profile_file="$PROFILES_DIR/$name.profile"
   
   {
-    echo "# Network destination: $name"
+    echo "# Connection profile: $name"
     echo "# Created: $(date)"
-    printf 'NET_TYPE=%q\n' "$type"
+    echo "# Type: $type"
+    printf 'PROFILE_TYPE=%q\n' "$type"
     case "$type" in
       SMB)
-        printf 'NET_SERVER=%q\n' "$NET_SERVER"
-        printf 'NET_SHARE=%q\n' "$NET_SHARE"
-        printf 'NET_USER=%q\n' "$NET_USER"
-        printf 'NET_PASSWORD=%q\n' "$NET_PASSWORD"
-        printf 'NET_DOMAIN=%q\n' "$NET_DOMAIN"
+        printf 'SMB_SERVER=%q\n' "$SMB_SERVER"
+        printf 'SMB_SHARE=%q\n' "$SMB_SHARE"
+        printf 'SMB_USER=%q\n' "$SMB_USER"
+        printf 'SMB_PASSWORD=%q\n' "$SMB_PASSWORD"
+        printf 'SMB_DOMAIN=%q\n' "$SMB_DOMAIN"
         ;;
       SSHFS)
-        printf 'NET_SSH_HOST=%q\n' "$NET_SSH_HOST"
-        printf 'NET_SSH_USER=%q\n' "$NET_SSH_USER"
-        printf 'NET_SSH_PATH=%q\n' "$NET_SSH_PATH"
-        printf 'NET_SSH_PORT=%q\n' "$NET_SSH_PORT"
-        printf 'NET_SSH_KEY=%q\n' "$NET_SSH_KEY"
+        printf 'SSHFS_HOST=%q\n' "$SSHFS_HOST"
+        printf 'SSHFS_USER=%q\n' "$SSHFS_USER"
+        printf 'SSHFS_PATH=%q\n' "$SSHFS_PATH"
+        printf 'SSHFS_PORT=%q\n' "$SSHFS_PORT"
+        printf 'SSHFS_KEY=%q\n' "$SSHFS_KEY"
         ;;
     esac
-  } > "$config_file"
-  chmod 600 "$config_file"
+  } > "$profile_file"
+  chmod 600 "$profile_file"
+  success "Профиль '$name' сохранен"
 }
 
-load_network_destination(){
+load_connection_profile(){
   local name="$1"
-  local config_file="$NET_CONFIG_DIR/$name.conf"
-  [[ -f "$config_file" ]] || return 1
+  local profile_file="$PROFILES_DIR/$name.profile"
+  [[ -f "$profile_file" ]] || return 1
   # shellcheck disable=SC1090
-  . "$config_file" 2>/dev/null || return 1
+  . "$profile_file" 2>/dev/null || return 1
 }
 
-list_network_destinations(){
-  mkdir -p "$NET_CONFIG_DIR" 2>/dev/null
-  find "$NET_CONFIG_DIR" -name "*.conf" -exec basename {} .conf \; 2>/dev/null | sort
+list_connection_profiles(){
+  mkdir -p "$PROFILES_DIR" 2>/dev/null
+  find "$PROFILES_DIR" -name "*.profile" -exec basename {} .profile \; 2>/dev/null | sort
 }
 
-get_destination_description(){
+get_profile_description(){
   local name="$1"
-  load_network_destination "$name" || return 1
-  case "$NET_TYPE" in
-    SMB) echo "SMB: $NET_SERVER/$NET_SHARE" ;;
-    SSHFS) echo "SSHFS: $NET_SSH_USER@$NET_SSH_HOST:$NET_SSH_PATH" ;;
-    *) echo "Unknown" ;;
+  load_connection_profile "$name" || return 1
+  case "$PROFILE_TYPE" in
+    SMB) echo "SMB: $SMB_SERVER/$SMB_SHARE (пользователь: $SMB_USER)" ;;
+    SSHFS) echo "SSHFS: $SSHFS_USER@$SSHFS_HOST:$SSHFS_PATH" ;;
+    *) echo "Неизвестный тип" ;;
   esac
 }
 
-# Остальные helper-функции без изменений...
-get_device_size(){ local dev="$1"; blockdev --getsize64 "$dev" 2>/dev/null || echo 0; }
+manage_connection_profiles(){
+  while true; do
+    clear
+    echo -e "${CYAN}== Управление профилями подключений ==${NC}\n"
+    
+    local profiles
+    mapfile -t profiles < <(list_connection_profiles)
+    
+    if [[ ${#profiles[@]} -eq 0 ]]; then
+      warning "Нет сохранённых профилей"
+    else
+      echo "Сохранённые профили:"
+      local i=1
+      for profile in "${profiles[@]}"; do
+        local desc
+        desc=$(get_profile_description "$profile")
+        printf "%d) %s - %s\n" $i "$profile" "$desc"
+        ((i++))
+      done
+      echo
+      echo "d) Удалить профиль"
+    fi
+    
+    echo "b) Назад"
+    echo
+    
+    local choice
+    read -r -p "Выбор: " choice
+    
+    case "$choice" in
+      d|D)
+        if [[ ${#profiles[@]} -eq 0 ]]; then
+          warning "Нет профилей для удаления"
+          read -r -p "Enter..."
+          continue
+        fi
+        
+        echo "Выберите профиль для удаления:"
+        local i=1
+        for profile in "${profiles[@]}"; do
+          printf "%d) %s\n" $i "$profile"
+          ((i++))
+        done
+        
+        local del_choice
+        read -r -p "Номер профиля: " del_choice
+        
+        if [[ "$del_choice" =~ ^[0-9]+$ && $del_choice -ge 1 && $del_choice -le ${#profiles[@]} ]]; then
+          local profile_to_delete="${profiles[$((del_choice-1))]}"
+          read -r -p "Удалить профиль '$profile_to_delete'? (y/N): " confirm
+          if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            rm -f "$PROFILES_DIR/$profile_to_delete.profile"
+            success "Профиль '$profile_to_delete' удален"
+          fi
+        else
+          warning "Неверный выбор"
+        fi
+        read -r -p "Enter..."
+        ;;
+      b|B) return ;;
+      *) warning "Неверный выбор"; read -r -p "Enter..." ;;
+    esac
+  done
+}
+
+check_core_dependencies(){
+  local need=(lsblk dd mount umount gzip gunzip df stat blockdev awk sed grep tr)
+  local miss=() d
+  for d in "${need[@]}"; do 
+    command -v "$d" >/dev/null 2>&1 || miss+=("$d")
+  done
+  [[ ${#miss[@]} -gt 0 ]] && { error "Install: ${miss[*]}"; exit 1; }
+}
+
+check_progress_tools(){
+  command -v pv >/dev/null 2>&1 && HAS_PV=true
+  command -v dcfldd >/dev/null 2>&1 && HAS_DCFLDD=true
+  command -v progress >/dev/null 2>&1 && HAS_PROGRESS=true
+  if $HAS_PV; then PROGRESS_METHOD="pv"
+  elif $HAS_DCFLDD; then PROGRESS_METHOD="dcfldd"
+  else PROGRESS_METHOD="builtin"; fi
+  info "Progress method: $PROGRESS_METHOD"
+}
+
+check_network_tools(){
+  command -v mount.cifs >/dev/null 2>&1 && HAS_CIFS_UTILS=true
+  command -v sshfs >/dev/null 2>&1 && HAS_SSHFS=true
+}
+
+get_device_size(){ 
+  local dev="$1"
+  blockdev --getsize64 "$dev" 2>/dev/null || echo 0
+}
 
 format_size(){
   local b="$1"
@@ -153,8 +235,13 @@ format_time(){
   fi
 }
 
-list_disks_raw(){ lsblk -pdn -o NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}'; }
-find_all_partitions(){ lsblk -pln -o NAME,TYPE 2>/dev/null | awk '$2=="part"{print $1}'; }
+list_disks_raw(){
+  lsblk -pdn -o NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}'
+}
+
+find_all_partitions(){
+  lsblk -pln -o NAME,TYPE 2>/dev/null | awk '$2=="part"{print $1}'
+}
 
 get_partition_details(){
   local dev="$1"
@@ -175,31 +262,6 @@ get_partition_details(){
 get_disk_partitions_simple(){
   local disk="$1"
   lsblk -pln -o NAME,TYPE "$disk" 2>/dev/null | awk '$2=="part"{print $1}'
-}
-
-# Функции проверки зависимостей (без изменений)
-check_core_dependencies(){
-  local need=(lsblk dd mount umount gzip gunzip df stat blockdev awk sed grep tr)
-  local miss=() d
-  for d in "${need[@]}"; do 
-    command -v "$d" >/dev/null 2>&1 || miss+=("$d")
-  done
-  [[ ${#miss[@]} -gt 0 ]] && { error "Install: ${miss[*]}"; exit 1; }
-}
-
-check_progress_tools(){
-  command -v pv >/dev/null 2>&1 && HAS_PV=true
-  command -v dcfldd >/dev/null 2>&1 && HAS_DCFLDD=true
-  command -v progress >/dev/null 2>&1 && HAS_PROGRESS=true
-  if $HAS_PV; then PROGRESS_METHOD="pv"
-  elif $HAS_DCFLDD; then PROGRESS_METHOD="dcfldd"
-  else PROGRESS_METHOD="builtin"; fi
-  info "Progress method: $PROGRESS_METHOD"
-}
-
-check_network_tools(){
-  command -v mount.cifs >/dev/null 2>&1 && HAS_CIFS_UTILS=true
-  command -v sshfs >/dev/null 2>&1 && HAS_SSHFS=true
 }
 
 show_detailed_disk_info(){
@@ -366,208 +428,6 @@ select_backup_targets(){
   read -r -p "Enter..."
 }
 
-# Обновленная функция конфигурации с поддержкой множественных назначений
-configure_destinations_menu(){
-  while true; do
-    clear
-    echo -e "${CYAN}== Настройка мест назначения ==${NC}\n"
-    
-    echo "1) Единое место назначения для всех устройств"
-    echo "2) Индивидуальные места назначения"
-    echo "3) Управление сохранёнными местами назначения"
-    echo "4) Назад"
-    
-    local choice
-    read -r -p "Выбор: " choice
-    
-    case "$choice" in
-      1) configure_single_destination ;;
-      2) configure_individual_destinations ;;
-      3) manage_saved_destinations ;;
-      4) return ;;
-      *) warning "Неверный выбор" ;;
-    esac
-  done
-}
-
-configure_single_destination(){
-  # Старая логика для единого назначения
-  while true; do
-    clear
-    echo -e "${CYAN}== Единое назначение ==${NC}\n"
-    local need
-    need=$(calculate_required_space)
-    info "Требуется ~ $(format_size "$need")"
-    [[ ${#SELECTED_DISKS[@]} -gt 0 ]] && info "Цели: ${SELECTED_DISKS[*]}"
-    
-    echo
-    echo "1) Локальная папка"
-    echo "2) SMB/CIFS"  
-    echo "3) SSH/SSHFS"
-    echo "4) Назад"
-    
-    local c
-    read -r -p "Выбор: " c
-    case "$c" in
-      1)
-        local p
-        read -r -p "Абсолютный путь: " p
-        [[ "$p" =~ ^/ ]] || { error "Нужен абсолютный путь"; read -r -p "Enter..."; continue; }
-        [[ -d "$p" ]] || { mkdir -p "$p" 2>/dev/null || { error "Не создать $p"; read -r -p "Enter..."; continue; }; }
-        [[ -w "$p" ]] || { error "Нет прав записи: $p"; read -r -p "Enter..."; continue; }
-        BACKUP_LOCATION="$p"
-        # Очищаем индивидуальные назначения
-        DEVICE_DESTINATIONS=()
-        save_config
-        success "Единое назначение: $BACKUP_LOCATION"
-        read -r -p "Enter..."
-        return
-        ;;
-      4) return ;;
-      *) warning "Неверный выбор" ;;
-    esac
-  done
-}
-
-configure_individual_destinations(){
-  [[ ${#SELECTED_DISKS[@]} -eq 0 ]] && { 
-    error "Сначала выберите устройства в пункте 2"
-    read -r -p "Enter..."
-    return
-  }
-  
-  clear
-  echo -e "${CYAN}== Индивидуальные назначения ==${NC}\n"
-  
-  for dev in "${SELECTED_DISKS[@]}"; do
-    echo -e "\n${YELLOW}Настройка для $dev:${NC}"
-    
-    # Показываем доступные места назначения
-    local destinations=()
-    destinations+=("LOCAL")
-    
-    while IFS= read -r name; do
-      [[ -n "$name" ]] && destinations+=("$name")
-    done < <(list_network_destinations)
-    
-    echo "Доступные назначения:"
-    echo "1) Локальная папка"
-    local i=2
-    for dest in "${destinations[@]:1}"; do
-      local desc
-      desc=$(get_destination_description "$dest")
-      printf "%d) %s (%s)\n" $i "$dest" "$desc"
-      ((i++))
-    done
-    echo "$i) Создать новое место назначения"
-    
-    local choice
-    read -r -p "Выбор для $dev: " choice
-    
-    if [[ $choice -eq 1 ]]; then
-      # Локальная папка
-      local path
-      read -r -p "Путь для $dev: " path
-      [[ "$path" =~ ^/ ]] && [[ -d "$path" || $(mkdir -p "$path" 2>/dev/null) ]] && {
-        DEVICE_DESTINATIONS["$dev"]="LOCAL:$path"
-        success "$dev -> $path"
-      }
-    elif [[ $choice -ge 2 && $choice -lt $i ]]; then
-      # Существующее место назначения
-      local dest_name="${destinations[$((choice-1))]}"
-      DEVICE_DESTINATIONS["$dev"]="$dest_name"
-      success "$dev -> $dest_name"
-    elif [[ $choice -eq $i ]]; then
-      # Создать новое место назначения
-      create_new_destination "$dev"
-    fi
-  done
-  
-  save_config
-  read -r -p "Enter..."
-}
-
-create_new_destination(){
-  local device="$1"
-  echo -e "\n${CYAN}Создание нового места назначения:${NC}"
-  
-  local name
-  read -r -p "Имя конфигурации: " name
-  [[ -z "$name" ]] && { warning "Пустое имя"; return; }
-  
-  echo "1) SMB/CIFS"
-  echo "2) SSHFS"
-  local type_choice
-  read -r -p "Тип: " type_choice
-  
-  case "$type_choice" in
-    1)
-      read -r -p "Сервер: " NET_SERVER
-      read -r -p "Шара: " NET_SHARE  
-      read -r -p "Пользователь: " NET_USER
-      read -r -s -p "Пароль: " NET_PASSWORD
-      echo
-      read -r -p "Домен (опц.): " NET_DOMAIN
-      
-      save_network_destination "$name" "SMB"
-      DEVICE_DESTINATIONS["$device"]="$name"
-      success "Создано: $name для $device"
-      ;;
-    2)
-      read -r -p "SSH пользователь: " NET_SSH_USER
-      read -r -p "Хост: " NET_SSH_HOST
-      read -r -p "Путь: " NET_SSH_PATH
-      read -r -p "Порт [22]: " NET_SSH_PORT
-      NET_SSH_PORT=${NET_SSH_PORT:-22}
-      read -r -p "SSH ключ (опц.): " NET_SSH_KEY
-      
-      save_network_destination "$name" "SSHFS"
-      DEVICE_DESTINATIONS["$device"]="$name"
-      success "Создано: $name для $device"
-      ;;
-  esac
-}
-
-manage_saved_destinations(){
-  while true; do
-    clear
-    echo -e "${CYAN}== Управление местами назначения ==${NC}\n"
-    
-    local destinations
-    mapfile -t destinations < <(list_network_destinations)
-    
-    if [[ ${#destinations[@]} -eq 0 ]]; then
-      warning "Нет сохранённых мест назначения"
-      read -r -p "Enter..."
-      return
-    fi
-    
-    local i=1
-    for dest in "${destinations[@]}"; do
-      local desc
-      desc=$(get_destination_description "$dest")
-      printf "%d) %s (%s)\n" $i "$dest" "$desc"
-      ((i++))
-    done
-    
-    echo "$i) Назад"
-    
-    local choice
-    read -r -p "Выберите для удаления: " choice
-    
-    if [[ $choice -ge 1 && $choice -le ${#destinations[@]} ]]; then
-      local dest_name="${destinations[$((choice-1))]}"
-      read -r -p "Удалить $dest_name? (y/N): " confirm
-      [[ "$confirm" =~ ^[Yy]$ ]] && {
-        rm -f "$NET_CONFIG_DIR/$dest_name.conf"
-        success "Удалено: $dest_name"
-      }
-    elif [[ $choice -eq $i ]]; then
-      return
-    fi
-  done
-}
-
 calculate_required_space(){ 
   local total=0
   [[ -z "${SELECTED_DISKS+x}" ]] && SELECTED_DISKS=()
@@ -579,88 +439,349 @@ calculate_required_space(){
   for t in "${SELECTED_DISKS[@]}"; do
     s=$(get_device_size "$t")
     [[ $s -eq 0 ]] && continue
-    # Более консервативная оценка - 30% от размера
     [[ $COMPRESSION_ENABLED == true ]] && s=$((s*30/100))
     total=$((total+s))
   done
   echo $((total + total/10))
 }
 
-# Функции монтирования (без изменений, но адаптированные для работы с новой системой)
-mount_destination(){
-  local dest_spec="$1"
-  
-  if [[ "$dest_spec" =~ ^LOCAL: ]]; then
-    local path="${dest_spec#LOCAL:}"
-    [[ -d "$path" && -w "$path" ]] && echo "$path" || return 1
-  else
-    # Сетевое назначение
-    load_network_destination "$dest_spec" || return 1
-    
-    local mount_point="/tmp/backup_mount_${dest_spec}_$$"
-    mkdir -p "$mount_point"
-    
-    case "$NET_TYPE" in
-      SMB)
-        local cred="/tmp/smb_cred_$$"
-        { 
-          echo "username=$NET_USER"
-          echo "password=$NET_PASSWORD"
-          [[ -n "$NET_DOMAIN" ]] && echo "domain=$NET_DOMAIN"
-        } > "$cred"
-        chmod 600 "$cred"
-        
-        local versions=("3.0" "2.1" "2.0" "1.0") v ok=false
-        for v in "${versions[@]}"; do
-          mount -t cifs "//$NET_SERVER/$NET_SHARE" "$mount_point" \
-            -o "credentials=$cred,vers=$v,uid=0,gid=0,file_mode=0644,dir_mode=0755" 2>/dev/null && {
-            ok=true
-            break
-          }
-        done
-        rm -f "$cred"
-        
-        $ok && mountpoint -q "$mount_point" && {
-          MOUNTED_POINTS["$dest_spec"]="$mount_point"
-          echo "$mount_point"
-        } || {
-          rmdir "$mount_point" 2>/dev/null
+check_local_path_conflicts(){
+  local dst="$1" realdst
+  realdst=$(readlink -f "$1" 2>/dev/null || echo "$1")
+  [[ -z "${SELECTED_DISKS+x}" ]] && SELECTED_DISKS=()
+  local t
+  for t in "${SELECTED_DISKS[@]}"; do
+    if [[ "$t" =~ [0-9]+$ ]]; then
+      local mnt
+      mnt=$(lsblk -pdn -o MOUNTPOINT "$t" 2>/dev/null | tr -d ' ')
+      if [[ -n "$mnt" ]]; then
+        local rmnt
+        rmnt=$(readlink -f "$mnt" 2>/dev/null || echo "$mnt")
+        [[ "$realdst/" == "$rmnt/"* || "$realdst" == "$rmnt" ]] && { 
+          error "Назначение на исходном разделе: $t ($mnt)"
           return 1
         }
-        ;;
-      SSHFS)
-        local opts="allow_other,default_permissions,reconnect,ServerAliveInterval=15"
-        [[ -n "$NET_SSH_KEY" && -f "$NET_SSH_KEY" ]] && opts="$opts,IdentityFile=$NET_SSH_KEY"
-        
-        sshfs -p "$NET_SSH_PORT" -o "$opts" "$NET_SSH_USER@$NET_SSH_HOST:$NET_SSH_PATH" "$mount_point" 2>/dev/null && \
-        mountpoint -q "$mount_point" && {
-          MOUNTED_POINTS["$dest_spec"]="$mount_point"
-          echo "$mount_point"
-        } || {
-          rmdir "$mount_point" 2>/dev/null
-          return 1
-        }
-        ;;
-    esac
+      fi
+    fi
+  done
+  return 0
+}
+
+check_free_space(){
+  local path="$1" need="$2"
+  [[ ! -d "$path" ]] && { 
+    error "No such dir: $path"
+    return 1
+  }
+  local avail
+  avail=$(df --output=avail -B1 "$path" 2>/dev/null | tail -n1)
+  [[ "$avail" =~ ^[0-9]+$ ]] || { 
+    warning "df unknown output for $path"
+    return 1
+  }
+  info "Avail: $(format_size "$avail") | Need: $(format_size "$need")"
+  [[ $avail -lt $need ]] && { 
+    error "Not enough space"
+    return 1
+  }
+  return 0
+}
+
+mount_smb_share(){
+  local server="$1" share="$2" user="$3" pass="$4" domain="$5"
+  command -v mount.cifs >/dev/null 2>&1 || { 
+    error "cifs-utils не установлены"
+    return 1
+  }
+  mkdir -p "$MOUNT_POINT"
+  local cred="/tmp/smb_cred_$$"
+  { 
+    echo "username=$user"
+    echo "password=$pass"
+    [[ -n "$domain" ]] && echo "domain=$domain"
+  } > "$cred"
+  chmod 600 "$cred"
+  local versions=("3.0" "2.1" "2.0" "1.0") v ok=false
+  for v in "${versions[@]}"; do
+    mount -t cifs "//$server/$share" "$MOUNT_POINT" \
+      -o "credentials=$cred,vers=$v,uid=0,gid=0,file_mode=0644,dir_mode=0755" 2>/dev/null && {
+      ok=true
+      break
+    }
+  done
+  rm -f "$cred"
+  $ok || { 
+    error "SMB монтирование не удалось"
+    rmdir "$MOUNT_POINT" 2>/dev/null
+    return 1
+  }
+  mountpoint -q "$MOUNT_POINT" || { 
+    error "SMB не смонтирован"
+    rmdir "$MOUNT_POINT"
+    return 1
+  }
+  touch "$MOUNT_POINT/.rwtest_$$" 2>/dev/null || { 
+    error "Нет записи на SMB"
+    umount "$MOUNT_POINT"
+    rmdir "$MOUNT_POINT"
+    return 1
+  }
+  rm -f "$MOUNT_POINT/.rwtest_$$"
+  success "SMB смонтирован: $MOUNT_POINT"
+  NETWORK_MOUNTED=true
+  BACKUP_LOCATION="$MOUNT_POINT"
+  return 0
+}
+
+mount_ssh_share(){
+  local user="$1" host="$2" path="$3" port="${4:-22}" key="$5"
+  command -v sshfs >/dev/null 2>&1 || { 
+    error "sshfs не установлен"
+    return 1
+  }
+  mkdir -p "$MOUNT_POINT"
+  local opts="allow_other,default_permissions,reconnect,ServerAliveInterval=15,StrictHostKeyChecking=no"
+  [[ -n "$key" && -f "$key" ]] && opts="$opts,IdentityFile=$key"
+  sshfs -p "$port" -o "$opts" "$user@$host:$path" "$MOUNT_POINT" 2>/dev/null || { 
+    error "SSHFS монтирование не удалось"
+    rmdir "$MOUNT_POINT"
+    return 1
+  }
+  mountpoint -q "$MOUNT_POINT" || { 
+    error "SSHFS не смонтирован"
+    rmdir "$MOUNT_POINT"
+    return 1
+  }
+  touch "$MOUNT_POINT/.rwtest_$$" 2>/dev/null || { 
+    error "Нет записи на SSHFS"
+    fusermount -u "$MOUNT_POINT" || umount "$MOUNT_POINT"
+    rmdir "$MOUNT_POINT"
+    return 1
+  }
+  rm -f "$MOUNT_POINT/.rwtest_$$"
+  success "SSHFS смонтирован: $MOUNT_POINT"
+  NETWORK_MOUNTED=true
+  BACKUP_LOCATION="$MOUNT_POINT"
+  return 0
+}
+
+cleanup_mounts(){ 
+  if $NETWORK_MOUNTED && [[ -d "$MOUNT_POINT" ]]; then
+    umount "$MOUNT_POINT" 2>/dev/null || \
+      fusermount -u "$MOUNT_POINT" 2>/dev/null || \
+      umount -l "$MOUNT_POINT" 2>/dev/null || true
+    rmdir "$MOUNT_POINT" 2>/dev/null || true
+    NETWORK_MOUNTED=false
+    info "Сетевой ресурс размонтирован"
   fi
 }
 
-cleanup_mounts(){
-  for dest in "${!MOUNTED_POINTS[@]}"; do
-    local mount_point="${MOUNTED_POINTS[$dest]}"
-    [[ -d "$mount_point" ]] && {
-      umount "$mount_point" 2>/dev/null || \
-        fusermount -u "$mount_point" 2>/dev/null || \
-        umount -l "$mount_point" 2>/dev/null || true
-      rmdir "$mount_point" 2>/dev/null || true
-    }
+configure_backup_destination(){
+  while true; do
+    clear
+    echo -e "${CYAN}== Назначение бэкапа ==${NC}\n"
+    local need
+    need=$(calculate_required_space)
+    info "Требуется ~ $(format_size "$need")"
+    [[ -z "${SELECTED_DISKS+x}" ]] && SELECTED_DISKS=()
+    [[ ${#SELECTED_DISKS[@]} -gt 0 ]] && info "Цели: ${SELECTED_DISKS[*]}"
+    echo
+    echo "1) Локальная папка"
+    echo "2) SMB/CIFS"
+    echo "3) SSH/SSHFS"
+    
+    local profiles
+    mapfile -t profiles < <(list_connection_profiles)
+    if [[ ${#profiles[@]} -gt 0 ]]; then
+      echo "4) Использовать сохранённый профиль"
+    fi
+    echo "5) Управление профилями"
+    echo "6) Назад"
+    
+    local c
+    read -r -p "Выбор: " c
+    case "$c" in
+      1)
+        cleanup_mounts
+        local p
+        read -r -p "Абсолютный путь к папке: " p
+        [[ "$p" =~ ^/ ]] || { 
+          error "Нужен абсолютный путь"
+          read -r -p "Enter..."
+          continue
+        }
+        [[ -d "$p" ]] || { 
+          warning "Создаём: $p"
+          mkdir -p "$p" 2>/dev/null || { 
+            error "Не создать $p"
+            read -r -p "Enter..."
+            continue
+          }
+        }
+        [[ -w "$p" ]] || { 
+          error "Нет прав на запись: $p"
+          read -r -p "Enter..."
+          continue
+        }
+        check_local_path_conflicts "$p" || { 
+          read -r -p "Enter..."
+          continue
+        }
+        check_free_space "$p" "$need" || { 
+          read -r -p "Продолжить? (y/N): " y
+          [[ "$y" =~ ^[Yy]$ ]] || continue
+        }
+        BACKUP_LOCATION="$p"
+        NETWORK_MOUNTED=false
+        success "Назначение: $BACKUP_LOCATION"
+        save_config
+        read -r -p "Enter..."
+        return 0
+        ;;
+      2)
+        cleanup_mounts
+        local s sh u pw d save_choice profile_name
+        read -r -p "Сервер (IP/имя): " s
+        read -r -p "Шара: " sh
+        read -r -p "Пользователь: " u
+        read -r -s -p "Пароль: " pw
+        echo
+        read -r -p "Домен (опц.): " d
+        
+        mount_smb_share "$s" "$sh" "$u" "$pw" "$d" || { 
+          read -r -p "Enter..."
+          continue
+        }
+        check_free_space "$MOUNT_POINT" "$need" || { 
+          error "Недостаточно места на SMB"
+          cleanup_mounts
+          read -r -p "Enter..."
+          continue
+        }
+        
+        read -r -p "Сохранить эти настройки как профиль? (y/N): " save_choice
+        if [[ "$save_choice" =~ ^[Yy]$ ]]; then
+          read -r -p "Имя профиля: " profile_name
+          if [[ -n "$profile_name" ]]; then
+            SMB_SERVER="$s"
+            SMB_SHARE="$sh"
+            SMB_USER="$u"
+            SMB_PASSWORD="$pw"
+            SMB_DOMAIN="$d"
+            save_connection_profile "$profile_name" "SMB"
+          fi
+        fi
+        
+        save_config
+        read -r -p "Enter..."
+        return 0
+        ;;
+      3)
+        cleanup_mounts
+        local su shost sp spn sk save_choice profile_name
+        read -r -p "SSH пользователь: " su
+        read -r -p "Хост: " shost
+        read -r -p "Удал. путь (напр., /backup): " sp
+        read -r -p "Порт [22]: " spn
+        spn=${spn:-22}
+        read -r -p "Путь к SSH-ключу (опц.): " sk
+        
+        mount_ssh_share "$su" "$shost" "$sp" "$spn" "$sk" || { 
+          read -r -p "Enter..."
+          continue
+        }
+        check_free_space "$MOUNT_POINT" "$need" || { 
+          error "Недостаточно места на SSHFS"
+          cleanup_mounts
+          read -r -p "Enter..."
+          continue
+        }
+        
+        read -r -p "Сохранить эти настройки как профиль? (y/N): " save_choice
+        if [[ "$save_choice" =~ ^[Yy]$ ]]; then
+          read -r -p "Имя профиля: " profile_name
+          if [[ -n "$profile_name" ]]; then
+            SSHFS_HOST="$shost"
+            SSHFS_USER="$su"
+            SSHFS_PATH="$sp"
+            SSHFS_PORT="$spn"
+            SSHFS_KEY="$sk"
+            save_connection_profile "$profile_name" "SSHFS"
+          fi
+        fi
+        
+        save_config
+        read -r -p "Enter..."
+        return 0
+        ;;
+      4)
+        if [[ ${#profiles[@]} -gt 0 ]]; then
+          cleanup_mounts
+          echo "Выберите профиль:"
+          local i=1
+          for profile in "${profiles[@]}"; do
+            local desc
+            desc=$(get_profile_description "$profile")
+            printf "%d) %s - %s\n" $i "$profile" "$desc"
+            ((i++))
+          done
+          
+          local profile_choice
+          read -r -p "Номер профиля: " profile_choice
+          
+          if [[ "$profile_choice" =~ ^[0-9]+$ && $profile_choice -ge 1 && $profile_choice -le ${#profiles[@]} ]]; then
+            local selected_profile="${profiles[$((profile_choice-1))]}"
+            load_connection_profile "$selected_profile" || {
+              error "Не удалось загрузить профиль"
+              read -r -p "Enter..."
+              continue
+            }
+            
+            case "$PROFILE_TYPE" in
+              SMB)
+                mount_smb_share "$SMB_SERVER" "$SMB_SHARE" "$SMB_USER" "$SMB_PASSWORD" "$SMB_DOMAIN" || { 
+                  read -r -p "Enter..."
+                  continue
+                }
+                ;;
+              SSHFS)
+                mount_ssh_share "$SSHFS_USER" "$SSHFS_HOST" "$SSHFS_PATH" "$SSHFS_PORT" "$SSHFS_KEY" || { 
+                  read -r -p "Enter..."
+                  continue
+                }
+                ;;
+            esac
+            
+            check_free_space "$MOUNT_POINT" "$need" || { 
+              error "Недостаточно места"
+              cleanup_mounts
+              read -r -p "Enter..."
+              continue
+            }
+            save_config
+            read -r -p "Enter..."
+            return 0
+          else
+            warning "Неверный выбор"
+            read -r -p "Enter..."
+          fi
+        fi
+        ;;
+      5)
+        manage_connection_profiles
+        ;;
+      6) 
+        return 1 
+        ;;
+      *) 
+        warning "Неверный выбор"
+        ;;
+    esac
   done
-  MOUNTED_POINTS=()
 }
 
 make_backup_session_dir(){ 
-  local base="$1"
-  local host ts dir
+  local base="$BACKUP_LOCATION" host ts dir
   host="$(hostname -s 2>/dev/null || hostname)"
   ts="$(date +%Y-%m-%d_%H%M%S)"
   dir="$base/$host/$ts"
@@ -744,21 +865,19 @@ perform_backup(){
     read -r -p "Enter..."
     return 1
   fi
-
-  # Проверяем настройки назначения
-  local use_individual=false
-  if [[ ${#DEVICE_DESTINATIONS[@]} -gt 0 ]]; then
-    use_individual=true
-    info "Используются индивидуальные назначения"
-  elif [[ -n "$BACKUP_LOCATION" ]]; then
-    info "Используется единое назначение: $BACKUP_LOCATION"
-  else
-    error "Не настроено ни одно место назначения"
+  if [[ -z "$BACKUP_LOCATION" ]]; then 
+    error "Назначение не настроено"
+    read -r -p "Enter..."
+    return 1
+  fi
+  if [[ ! -d "$BACKUP_LOCATION" || ! -w "$BACKUP_LOCATION" ]]; then 
+    error "Назначение не доступно для записи"
     read -r -p "Enter..."
     return 1
   fi
 
   info "Цели: ${SELECTED_DISKS[*]}"
+  info "Назначение: $BACKUP_LOCATION"
   info "Сжатие: $($COMPRESSION_ENABLED && echo on || echo off)"
 
   local a
@@ -769,7 +888,13 @@ perform_backup(){
     return 1
   }
 
-  local ok=0 total=${#SELECTED_DISKS[@]} 
+  local session
+  session=$(make_backup_session_dir) || { 
+    read -r -p "Enter..."
+    return 1
+  }
+  
+  local ok=0 total=${#SELECTED_DISKS[@]} src base ttype out
   local total_original=0 total_compressed=0
 
   for src in "${SELECTED_DISKS[@]}"; do
@@ -777,33 +902,11 @@ perform_backup(){
       error "No device: $src"
       continue
     }
-
-    # Определяем место назначения для устройства
-    local backup_location
-    if $use_individual; then
-      local dest_spec="${DEVICE_DESTINATIONS[$src]}"
-      [[ -z "$dest_spec" ]] && { 
-        error "Не задано назначение для $src"
-        continue
-      }
-      backup_location=$(mount_destination "$dest_spec") || {
-        error "Не удалось подключить назначение для $src"
-        continue
-      }
-    else
-      backup_location="$BACKUP_LOCATION"
-    fi
-
-    local session
-    session=$(make_backup_session_dir "$backup_location") || continue
-    
-    local base ttype out
     base=$(basename "$src")
     ttype="disk"
     [[ "$src" =~ [0-9]+$ ]] && ttype="part"
     out="$session/${base}_${ttype}.img"
     $COMPRESSION_ENABLED && out="${out}.gz"
-    
     log "$src -> $out"
     
     local original_size
@@ -834,10 +937,8 @@ perform_backup(){
   fi
   
   read -r -p "Enter..."
-  cleanup_mounts
 }
 
-# Остальные функции без изменений (analyze_backup_requirements, restore, etc.)
 analyze_backup_requirements(){
   clear
   echo -e "${CYAN}== Оценка ==${NC}\n"
@@ -873,18 +974,360 @@ analyze_backup_requirements(){
     fi
   fi
   
+  echo
+  if [[ -n "$BACKUP_LOCATION" && -d "$BACKUP_LOCATION" ]]; then
+    local avail
+    avail=$(df --output=avail -B1 "$BACKUP_LOCATION" 2>/dev/null | tail -n1)
+    if [[ "$avail" =~ ^[0-9]+$ ]]; then 
+      echo -e "${YELLOW}Доступно в назначении:${NC} $(format_size "$avail")"
+      echo -e "${YELLOW}Путь назначения:${NC} $BACKUP_LOCATION"
+    else 
+      warning "Назначение недоступно или не смонтировано: $BACKUP_LOCATION"
+    fi
+  else
+    warning "Назначение не настроено - настройте в пункте меню 3"
+  fi
+  
   read -r -p "Enter..."
 }
 
-# Остальные функции меню и системы остаются без изменений...
+choose_target_device(){
+  local ITEMS=() INFOS=()
+  {
+    echo -e "${CYAN}== Выбор целевого устройства ==${NC}\n"
+    
+    while IFS= read -r dev; do
+      [[ -b "$dev" ]] || continue
+      local size model serial
+      size=$(format_size "$(get_device_size "$dev")")
+      model=$(lsblk -pdn -o MODEL "$dev" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+      serial=$(lsblk -pdn -o SERIAL "$dev" 2>/dev/null | tr -d ' ')
+      INFOS+=("ДИСК: ${size:-?} ${model:+- $model} ${serial:+(S/N: $serial)}")
+      ITEMS+=("$dev")
+    done < <(list_disks_raw)
+    
+    while IFS= read -r part; do
+      [[ -b "$part" ]] || continue
+      local details psize pfs plabel pmount
+      details=$(get_partition_details "$part")
+      IFS='|' read -r psize pfs plabel pmount <<< "$details"
+      
+      local desc="РАЗДЕЛ: ${psize:-?}"
+      [[ "$pfs" != "-" ]] && desc="$desc [$pfs]"
+      [[ "$plabel" != "-" ]] && desc="$desc \"$plabel\""
+      [[ "$pmount" != "-" ]] && desc="$desc -> $pmount"
+      
+      INFOS+=("$desc")
+      ITEMS+=("$part")
+    done < <(find_all_partitions)
+    
+    if [[ ${#ITEMS[@]} -eq 0 ]]; then 
+      echo -e "${RED}[ERROR]${NC} Нет доступных устройств"
+      echo
+      echo "" 1>&3
+      return
+    fi
+    
+    local i
+    for i in "${!ITEMS[@]}"; do
+      printf "%2d) %-16s %s\n" $((i+1)) "${ITEMS[i]}" "${INFOS[i]}"
+    done
+    echo
+    printf "%s\0" "${ITEMS[@]}" 1>&3
+  } 1>&2 3>"/tmp/.choose_list_$$"
+  
+  local nsel
+  read -r -p "Номер устройства: " nsel 1>&2
+  mapfile -d '' -t __ALL < "/tmp/.choose_list_$$"
+  rm -f "/tmp/.choose_list_$$"
+  
+  if [[ "$nsel" =~ ^[0-9]+$ && $nsel -ge 1 && $nsel -le ${#__ALL[@]} ]]; then 
+    echo "${__ALL[$((nsel-1))]}"
+  else 
+    echo ""
+  fi
+}
+
+validate_image_vs_target(){
+  local image="$1" target="$2"
+  local is_gz=0
+  [[ "$image" =~ \.gz$ ]] && is_gz=1
+  local itype="unknown"
+  [[ "$image" =~ _disk\.img(\.gz)?$ ]] && itype="disk"
+  [[ "$image" =~ _part\.img(\.gz)?$ ]] && itype="part"
+  local ttype="disk"
+  [[ "$target" =~ [0-9]+$ ]] && ttype="part"
+  
+  if [[ "$itype" != "unknown" && "$itype" != "$ttype" ]]; then
+    warning "Тип образа ($itype) <> тип цели ($ttype)"
+    local c
+    read -r -p "Продолжить? (y/N): " c
+    [[ "$c" =~ ^[Yy]$ ]] || return 1
+  fi
+  
+  local mp
+  mp=$(lsblk -pdn -o MOUNTPOINT "$target" 2>/dev/null | tr -d ' ')
+  [[ -n "$mp" ]] && { 
+    error "Цель смонтирована: $mp"
+    return 1
+  }
+  
+  if [[ $is_gz -eq 0 ]]; then
+    local isize tsize
+    isize=$(stat -c%s "$image" 2>/dev/null || echo 0)
+    tsize=$(get_device_size "$target")
+    [[ $isize -gt 0 && $tsize -gt 0 && $isize -gt $tsize ]] && { 
+      error "Образ больше цели ($(format_size "$isize") > $(format_size "$tsize"))"
+      return 1
+    }
+  else
+    info "Образ .gz: исходный размер неизвестен — осторожно."
+  fi
+  return 0
+}
+
+restore_from_image(){
+  local image="$1" target="$2"
+  [[ -f "$image" ]] || { 
+    error "No file: $image"
+    read -r -p "Enter..."
+    return 1
+  }
+  [[ -b "$target" ]] || { 
+    error "No target: $target"
+    read -r -p "Enter..."
+    return 1
+  }
+  validate_image_vs_target "$image" "$target" || { 
+    read -r -p "Enter..."
+    return 1
+  }
+  echo -e "${RED}DANGER:${NC} overwrite $target"
+  local x
+  read -r -p "Type YES to continue: " x
+  [[ "$x" == "YES" ]] || { 
+    warning "Canceled"
+    read -r -p "Enter..."
+    return 1
+  }
+  local rc=0
+  if [[ "$image" =~ \.gz$ ]]; then 
+    gunzip -c "$image" | dd of="$target" bs=1M conv=fsync status=progress
+    rc=${PIPESTATUS[1]}
+  else 
+    dd if="$image" of="$target" bs=1M conv=fsync status=progress
+    rc=$?
+  fi
+  [[ $rc -eq 0 ]] && success "Restored" || error "Restore failed"
+  read -r -p "Enter..."
+  return $rc
+}
+
+restore_menu(){
+  clear
+  echo -e "${CYAN}== Восстановление ==${NC}\n"
+  if [[ -z "$BACKUP_LOCATION" ]]; then 
+    error "Назначение не настроено"
+    read -r -p "Enter..."
+    return
+  fi
+  echo "1) Из сессии (<host>/<date>)"
+  echo "2) Указать файл вручную"
+  echo "3) Файлы в корне назначения"
+  echo "4) Назад"
+  local ch
+  read -r -p "Выбор: " ch
+  case "$ch" in
+    1)
+      local sessions=()
+      while IFS= read -r s; do 
+        sessions+=("$s")
+      done < <(find "$BACKUP_LOCATION" -mindepth 2 -maxdepth 2 -type d -printf "%P\n" 2>/dev/null | sort)
+      
+      if [[ ${#sessions[@]} -eq 0 ]]; then 
+        warning "Сессии не найдены"
+        read -r -p "Enter..."
+        return
+      fi
+      
+      local i
+      for i in "${!sessions[@]}"; do
+        printf "%2d) %s\n" $((i+1)) "${sessions[i]}"
+      done
+      local n
+      read -r -p "Номер сессии: " n
+      
+      if [[ "$n" =~ ^[0-9]+$ && $n -ge 1 && $n -le ${#sessions[@]} ]]; then
+        local dir="$BACKUP_LOCATION/${sessions[$((n-1))]}" files=()
+        while IFS= read -r f; do 
+          files+=("$f")
+        done < <(find "$dir" -maxdepth 1 -type f \( -name "*.img" -o -name "*.img.gz" \) -printf "%f\n" 2>/dev/null | sort)
+        
+        if [[ ${#files[@]} -eq 0 ]]; then 
+          warning "В сессии нет образов"
+          read -r -p "Enter..."
+          return
+        fi
+        
+        local j
+        for j in "${!files[@]}"; do
+          printf "%2d) %s\n" $((j+1)) "${files[j]}"
+        done
+        local fn
+        read -r -p "Номер файла: " fn
+        
+        if [[ "$fn" =~ ^[0-9]+$ && $fn -ge 1 && $fn -le ${#files[@]} ]]; then
+          local image="$dir/${files[$((fn-1))]}" target
+          target="$(choose_target_device)"
+          [[ -n "$target" ]] || { 
+            warning "Не выбрано"
+            read -r -p "Enter..."
+            return
+          }
+          restore_from_image "$image" "$target"
+        else 
+          warning "Неверный выбор"
+          read -r -p "Enter..."
+        fi
+      else 
+        warning "Неверный выбор"
+        read -r -p "Enter..."
+      fi
+      ;;
+    2)
+      local image
+      read -r -p "Путь к образу (.img/.img.gz): " image
+      [[ -f "$image" ]] || { 
+        error "Нет файла"
+        read -r -p "Enter..."
+        return
+      }
+      local target
+      target="$(choose_target_device)"
+      [[ -n "$target" ]] || { 
+        warning "Не выбрано"
+        read -r -p "Enter..."
+        return
+      }
+      restore_from_image "$image" "$target"
+      ;;
+    3)
+      local dir="$BACKUP_LOCATION" files=()
+      while IFS= read -r f; do 
+        files+=("$f")
+      done < <(find "$dir" -maxdepth 1 -type f \( -name "*.img" -o -name "*.img.gz" \) -printf "%f\n" 2>/dev/null | sort)
+      
+      if [[ ${#files[@]} -eq 0 ]]; then 
+        warning "Нет образов"
+        read -r -p "Enter..."
+        return
+      fi
+      
+      local k
+      for k in "${!files[@]}"; do
+        printf "%2d) %s\n" $((k+1)) "${files[k]}"
+      done
+      local fn2
+      read -r -p "Номер файла: " fn2
+      
+      if [[ "$fn2" =~ ^[0-9]+$ && $fn2 -ge 1 && $fn2 -le ${#files[@]} ]]; then
+        local image="$dir/${files[$((fn2-1))]}" target
+        target="$(choose_target_device)"
+        [[ -n "$target" ]] || { 
+          warning "Не выбрано"
+          read -r -p "Enter..."
+          return
+        }
+        restore_from_image "$image" "$target"
+      else 
+        warning "Неверный выбор"
+        read -r -p "Enter..."
+      fi
+      ;;
+    4) 
+      return 
+      ;;
+    *) 
+      warning "Неверный выбор"
+      read -r -p "Enter..."
+      ;;
+  esac
+}
+
+install_utilities_menu(){
+  while true; do
+    clear
+    echo -e "${CYAN}== Установка утилит ==${NC}"
+    echo "1) Установить pv/dcfldd/sshfs/cifs-utils (через пакетный менеджер)"
+    echo "2) Назад"
+    echo
+    echo "Статус: pv=$($HAS_PV && echo yes || echo no), dcfldd=$($HAS_DCFLDD && echo yes || echo no), sshfs=$($HAS_SSHFS && echo yes || echo no), cifs-utils=$($HAS_CIFS_UTILS && echo yes || echo no)"
+    read -r -p "Выбор: " c
+    case "$c" in
+      1)
+        if command -v apt >/dev/null 2>&1; then 
+          apt update && apt install -y pv dcfldd sshfs cifs-utils || warning "apt failed"
+        elif command -v dnf >/dev/null 2>&1; then 
+          dnf install -y pv dcfldd sshfs cifs-utils || warning "dnf failed"
+        elif command -v yum >/dev/null 2>&1; then 
+          yum install -y pv dcfldd sshfs cifs-utils || warning "yum failed"
+        else 
+          warning "Unknown package manager"
+        fi
+        ;;
+      2) 
+        break 
+        ;;
+      *) 
+        warning "Неверный выбор"
+        ;;
+    esac
+    check_progress_tools
+    check_network_tools
+    read -r -p "Enter..."
+  done
+}
+
+toggle_compression(){ 
+  $COMPRESSION_ENABLED && COMPRESSION_ENABLED=false || COMPRESSION_ENABLED=true
+  success "Сжатие: $($COMPRESSION_ENABLED && echo on || echo off)"
+  save_config
+  read -r -p "Enter..."
+}
+
+show_current_settings(){
+  clear
+  echo -e "${CYAN}== Текущие настройки ==${NC}\n"
+  echo -e "${YELLOW}Цели:${NC}"
+  [[ -z "${SELECTED_DISKS+x}" ]] && SELECTED_DISKS=()
+  if [[ ${#SELECTED_DISKS[@]} -eq 0 ]]; then 
+    echo "  (нет)"
+  else 
+    local t
+    for t in "${SELECTED_DISKS[@]}"; do
+      echo "  - $t"
+    done
+  fi
+  echo -e "\n${YELLOW}Назначение:${NC} ${BACKUP_LOCATION:-(нет)}"
+  echo -e "${YELLOW}Сетевое монтирование:${NC} $($NETWORK_MOUNTED && echo yes || echo no)"
+  echo -e "${YELLOW}Сжатие:${NC} $($COMPRESSION_ENABLED && echo on || echo off)"
+  echo -e "${YELLOW}Прогресс:${NC} $PROGRESS_METHOD"
+  echo
+  local profiles
+  mapfile -t profiles < <(list_connection_profiles)
+  echo -e "${YELLOW}Сохранённых профилей:${NC} ${#profiles[@]}"
+  echo
+  read -r -p "Enter..."
+}
+
 show_main_menu(){
   clear
   echo -e "${CYAN}╔═══════════════════════════════════════╗${NC}"
-  echo -e "${CYAN}║   DISK BACKUP MANAGER v6.7            ║${NC}"
+  echo -e "${CYAN}║   DISK BACKUP MANAGER v6.8            ║${NC}"
   echo -e "${CYAN}╚═══════════════════════════════════════╝${NC}\n"
   echo "1) Показать диски и разделы"
   echo "2) Выбрать цели для бэкапа"
-  echo "3) Настроить места назначения"
+  echo "3) Настроить место назначения"
   echo "4) Оценка размера и места"
   echo "5) Выполнить бэкап"
   echo "6) Восстановление (диск/раздел)"
@@ -892,19 +1335,6 @@ show_main_menu(){
   echo "8) Установка утилит"
   echo "9) Выход"
   echo
-}
-
-# Заглушки для отсутствующих функций (добавьте по необходимости)
-choose_target_device(){ echo "/dev/sda1"; }  # Placeholder
-validate_image_vs_target(){ return 0; }     # Placeholder  
-restore_from_image(){ return 0; }           # Placeholder
-restore_menu(){ echo "Restore menu placeholder"; read -r -p "Enter..."; }
-install_utilities_menu(){ echo "Install menu placeholder"; read -r -p "Enter..."; }
-toggle_compression(){ 
-  $COMPRESSION_ENABLED && COMPRESSION_ENABLED=false || COMPRESSION_ENABLED=true
-  success "Сжатие: $($COMPRESSION_ENABLED && echo on || echo off)"
-  save_config
-  read -r -p "Enter..."
 }
 
 main(){
@@ -917,7 +1347,7 @@ main(){
     case "$c" in
       1) show_detailed_disk_info ;;
       2) select_backup_targets ;;
-      3) configure_destinations_menu ;;
+      3) configure_backup_destination ;;
       4) analyze_backup_requirements ;;
       5) perform_backup ;;
       6) restore_menu ;;
