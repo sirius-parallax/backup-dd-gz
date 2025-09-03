@@ -507,11 +507,7 @@ backup-manager/
 Данный проект распространяется под лицензией MIT. Подробности в файле [LICENSE](LICENSE).
 
 ## 📞 Поддержка
-
-- **GitHub Issues:** [Создать issue](https://github.com/your-repo/issues)
-- **Обсуждения:** [GitHub Discussions](https://github.com/your-repo/discussions)
-- **Email:** support@your-domain.com
-- **Telegram:** @your-telegram
+...
 
 ## 📈 История версий
 
